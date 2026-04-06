@@ -1,4 +1,4 @@
-# GeoGuessr Automation Engine (v5.4)
+# GeoGuessr XP BOT
 
 A highly optimized, professional-grade Node.js automation script for GeoGuessr Country Streaks. Built with performance and stability in mind.
 
@@ -10,7 +10,7 @@ Current benchmarks achieved on a standard stable connection:
 | :--- | :--- |
 | **Round Completion Delay** | **~0.10s (100ms)** |
 | **Average Speed (50 Rounds)** | **~5.5 - 6.5 seconds** |
-| **Effective XP Yield** | **~400,000 - 600,000 XP / Hour** |
+| **Effective XP Yield** | **~400,000 - 450,000 XP / Hour** |
 
 ## ⏳ Estimated Levelling Time
 
