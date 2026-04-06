@@ -10,7 +10,7 @@ Current benchmarks achieved on a standard stable connection:
 | :--- | :--- |
 | **Round Completion Delay** | **~0.10s (100ms)** |
 | **Average Speed (50 Rounds)** | **~5.5 - 6.5 seconds** |
-| **Effective XP Yield** | **~400,000 - 450,000 XP / Hour** |
+| **Effective XP Yield** | **~380,000 - 450,000 XP / Hour** |
 
 ## ⏳ Estimated Levelling Time
 
