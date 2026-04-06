@@ -1,301 +1,285 @@
 const puppeteer = require('puppeteer');
+const undici = require('undici');
 const path = require('path');
 const fs = require('fs');
 const readline = require('readline');
 
-// --- BOT CONFIGURATION ---
-const API_DELAY_MS = 250;
-const STREAK_LIMIT = 50;
-const TARGET_URL = 'https://www.geoguessr.com/country-streak';
-const RESTART_INTERVAL_MS = 24 * 60 * 60 * 1000;
+/**
+ * GeoGuessr XP BOT
+ * Optimized for undici connection pooling and stealth operation.
+ * Performance: ~400k-600k XP/h (with jitter and adaptive delay).
+ */
+
+const CONFIG = {
+    MIN_DELAY_MS: 30,           // Minimum floor delay for stability
+    MAX_DELAY_MS: 60,
+    STREAK_LIMIT: 50,
+    TARGET_URL: 'https://www.geoguessr.com/country-streak',
+    RATE_LIMIT_PAUSE_MS: 7500,
+    COOLING_PAUSE_403_MS: 7500,  // Pause duration on 403 Forbidden detection
+    RESTART_INTERVAL_MS: 24 * 60 * 60 * 1000,
+    RETRY_ATTEMPTS: 3,
+    MAX_REQUEST_TIMEOUT_MS: 15000
+};
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const askQuestion = (query) => new Promise(resolve => rl.question(query, resolve));
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// --- TELEMETRY & STATE ---
-let activeToken = null;
-let currentCoords = null;
-let currentStreakCount = 0;
-let activeApiEndpoint = null;
+// --- GLOBAL STATE ---
+let session = { token: null, coords: null, streak: 0, cookies: null, ua: null };
+let sessionRecord = Infinity;
 let botStartTime = Date.now();
-let lastCycleStartTime = Date.now();
-let totalRoundsPlayed = 0;
-
-// Handle manual exit signal (Ctrl+C)
 let isExitingRequested = false;
+
+let baseHeaders = null;
+const client = new undici.Pool('https://www.geoguessr.com', {
+    connections: 15,
+    pipelining: 0,
+    keepAliveTimeout: 90000,
+    headersTimeout: 20000,
+    bodyTimeout: 20000
+});
+
 process.on('SIGINT', () => {
-    if (isExitingRequested) {
-        console.log('\n[STOP] Forced exit!');
-        process.exit();
-    }
     isExitingRequested = true;
-    console.log('\n\n[STOP] Signal received. Finishing current 50-streak before clean exit...');
+    console.log('\n\n[STOP] Shutdown requested. Finishing current streak...');
 });
 
 /**
- * Extracts guess coordinates from game data object
- * Supports v3 API payloads and raw panorama objects
+ * Randomize request headers to avoid fingerprinting.
+ */
+function getStealthHeaders() {
+    const variants = [
+        { 'cache-control': 'max-age=0' },
+        { 'pragma': 'no-cache' },
+        { 'sec-fetch-user': '?1' },
+        { 'upgrade-insecure-requests': '1' },
+        { 'x-requested-with': 'XMLHttpRequest' }
+    ];
+    // Select a random variation to mimic realistic browser behavior
+    const pick = variants[Math.floor(Math.random() * variants.length)];
+    return { ...baseHeaders, ...pick };
+}
+
+/**
+ * Robust API request handler using undici pooling.
+ */
+async function requestAPI(path, method = 'GET', body = null, useStealth = false) {
+    const options = {
+        method,
+        headers: useStealth ? getStealthHeaders() : baseHeaders,
+        body: body ? JSON.stringify(body) : undefined
+    };
+
+    let lastError;
+    for (let i = 0; i < CONFIG.RETRY_ATTEMPTS; i++) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), CONFIG.MAX_REQUEST_TIMEOUT_MS);
+        let responseBody;
+        try {
+            const result = await client.request({ path, ...options, signal: controller.signal });
+            responseBody = result.body;
+            const statusCode = result.statusCode;
+
+            if (statusCode === 429 || statusCode === 403) {
+                await responseBody.dump();
+                return { rateLimit: true, is403: (statusCode === 403) };
+            }
+            if (statusCode >= 400) {
+                await responseBody.dump();
+                throw new Error(`HTTP_STATUS_${statusCode}`);
+            }
+
+            const text = await responseBody.text();
+            if (text.trim().startsWith('{')) {
+                return { success: true, data: JSON.parse(text) };
+            } else {
+                throw new Error('INVALID_JSON_RESPONSE');
+            }
+        } catch (e) {
+            lastError = e;
+            if (responseBody) try { await responseBody.dump(); } catch (dumpErr) { }
+            if (i < CONFIG.RETRY_ATTEMPTS - 1) await sleep(50 * (i + 1));
+        } finally { clearTimeout(timeout); }
+    }
+    return { success: false, error: lastError?.message };
+}
+
+/**
+ * Extracts coordinate data from various API response structures.
  */
 function extractCoords(data) {
     if (!data) return null;
-    if (data.rounds && data.rounds.length > 0) {
-        const roundIndex = (data.round ? data.round : data.rounds.length) - 1;
-        const currentRound = data.rounds[roundIndex];
-        if (currentRound && typeof currentRound.lat === 'number') {
-            return {
-                lat: currentRound.lat,
-                lng: currentRound.lng,
-                streakCode: currentRound.streakLocationCode || null
-            };
-        }
+    let target = data.game ? data.game : data;
+    if (target.rounds && target.rounds.length > 0) {
+        const rIdx = (target.round !== undefined) ? target.round : (target.rounds.length - 1);
+        const curr = target.rounds[rIdx] || target.rounds[target.rounds.length - 1];
+        return curr && curr.lat ? { lat: curr.lat, lng: curr.lng, code: curr.streakLocationCode } : null;
     }
-    if (typeof data.lat === 'number') return { lat: data.lat, lng: data.lng };
-    if (data.panorama && typeof data.panorama.lat === 'number') return data.panorama;
-    return null;
+    return (target && target.lat) ? { lat: target.lat, lng: target.lng } : null;
 }
 
 /**
- * Initializes Puppeteer instance with optimized flags
- * Handles crash recovery and resource interception (media/css/trackers)
+ * Initializes session by extracting cookies and User-Agent from Puppeteer.
  */
-async function createBrowser(isHeadless) {
+async function extractSession() {
     const userDataDir = path.join(__dirname, 'session_data');
-
-    // Fix Chrome crash popup on startup
-    try {
-        const prefPath = path.join(userDataDir, 'Default', 'Preferences');
-        if (fs.existsSync(prefPath)) {
-            let prefs = fs.readFileSync(prefPath, 'utf8');
-            prefs = prefs.replace(/"exit_type"\s*:\s*"Crashed"/g, '"exit_type":"Normal"')
-                .replace(/"exited_cleanly"\s*:\s*false/g, '"exited_cleanly":true');
-            fs.writeFileSync(prefPath, prefs, 'utf8');
-        }
-    } catch (e) { }
-
     const browser = await puppeteer.launch({
-        headless: isHeadless ? 'new' : false,
+        headless: 'new',
         userDataDir: userDataDir,
-        handleSIGINT: false, // Prevents Puppeteer from closing browser on Ctrl+C automatically
-        handleSIGTERM: false,
-        handleSIGHUP: false,
-        defaultViewport: null,
-        args: [
-            '--start-maximized', '--disable-gpu', '--no-sandbox', '--disable-dev-shm-usage',
-            '--disk-cache-size=1', '--disable-blink-features=AutomationControlled',
-            '--disable-session-crashed-bubble', '--hide-crash-restore-window'
-        ]
+        args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage']
     });
-
-    const pages = await browser.pages();
+    let pages = await browser.pages();
+    while (pages.length > 1) { await pages.pop().close(); }
     const page = pages[0];
-
-    // Resource interception to reduce overhead
-    await page.setRequestInterception(true);
-    page.on('request', (req) => {
-        const type = req.resourceType();
-        const url = req.url();
-
-        // Filter analytics and social tracking
-        const isTracker = url.includes('google-analytics') || url.includes('googletagmanager') ||
-            url.includes('facebook') || url.includes('intercom') ||
-            url.includes('mixpanel') || url.includes('hotjar');
-
-        const blockList = ['image', 'media', 'font'];
-        if (isHeadless) blockList.push('stylesheet'); // Block CSS only in headless mode
-
-        if (blockList.includes(type) || url.includes('google.com/maps/vt/') || isTracker) {
-            req.abort();
-        } else {
-            req.continue();
-        }
-    });
-
-    // Bypass basic bot detection
-    await page.evaluateOnNewDocument(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    });
-
-    return { browser, page };
+    try {
+        await page.goto('https://www.geoguessr.com/', { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await sleep(3000);
+        const isLoggedOut = await page.evaluate(() => document.querySelector('a[href^="/signin"]') !== null);
+        if (isLoggedOut) { await browser.close(); return null; }
+        const pCookies = await page.cookies();
+        session.cookies = pCookies.map(c => `${c.name}=${c.value}`).join('; ');
+        session.ua = await page.evaluate(() => navigator.userAgent);
+        baseHeaders = {
+            'content-type': 'application/json',
+            'cookie': session.cookies,
+            'user-agent': session.ua,
+            'origin': 'https://www.geoguessr.com',
+            'referer': 'https://www.geoguessr.com/country-streak',
+            'accept': 'application/json, text/plain, */*',
+            'accept-language': 'en-US,en;q=0.9',
+            'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors', 'sec-fetch-site': 'same-origin', 'dnt': '1'
+        };
+    } catch (e) { }
+    await browser.close();
+    return (session.cookies && session.cookies.includes('_ncfa')) ? true : null;
 }
 
 /**
- * Validates current session status on GeoGuessr
- */
-async function checkLoggedIn(page) {
-    await page.goto('https://www.geoguessr.com/', { waitUntil: 'domcontentloaded' });
-    for (let i = 0; i < 5; i++) {
-        const isLoggedOut = await page.evaluate(() => {
-            return document.querySelector('a[href^="/signin"]') !== null || document.body.innerText.includes('LOG IN');
-        });
-        if (!isLoggedOut) return true;
-        await sleep(1000);
-    }
-    return false;
-}
-
-/**
- * Main application loop
- * Handles login flow and high-speed API agriculture
+ * Core execution engine.
  */
 async function main() {
-    // Reset state for potential auto-restarts
-    activeToken = null;
-    currentCoords = null;
-    currentStreakCount = 0;
-
     console.clear();
-    console.log('==========================================');
-    console.log('🤖 GeoGhost Bot - Country Streaks Farmer');
-    console.log(`⏱️ Auto-limit: ${STREAK_LIMIT} countries`);
-    console.log('==========================================\n');
+    console.log('----------------------------------------------');
+    console.log('GeoGuessr XP BOT');
+    console.log('Mode: Stealth-Adaptive | Pool: undici');
+    console.log('----------------------------------------------\n');
 
-    // Phase 1: Silent session probe
-    console.log('[BOT] Running silent session check...');
-    let { browser, page } = await createBrowser(true);
-    let sessionOk = await checkLoggedIn(page);
-
-    if (!sessionOk) {
-        console.log('[BOT] ⚠️ Session not found. Opening login window...');
-        await browser.close();
-
-        // Phase 2: Manual Login (Visible)
-        const visibleRes = await createBrowser(false);
-        browser = visibleRes.browser;
-        page = visibleRes.page;
-
-        await page.goto('https://www.geoguessr.com/signin', { waitUntil: 'domcontentloaded' });
-        console.log('\n-----------------------------------------------------------');
-        console.log('👉 LOG IN via the Chrome window that just opened.');
-        console.log('-----------------------------------------------------------');
-        await askQuestion('✅ Press [ENTER] here once logged in (on the main menu): ');
-
-        console.log('[BOT] Login detected. Switching to Ghost mode...');
-        await browser.close();
-
-        // Phase 3: Headless Farm Initialization
-        const finalRes = await createBrowser(true);
-        browser = finalRes.browser;
-        page = finalRes.page;
-    } else {
-        console.log('✅ Active session! Proceeding directly to invisible farming.');
+    if (!session.cookies) {
+        process.stdout.write('[SYSTEM] Probing session headers... ');
+        const hasSession = await extractSession();
+        if (!hasSession) {
+            console.log('FAILED\n[SYSTEM] Redirecting to login assistant...');
+            const browser = await puppeteer.launch({ headless: false, userDataDir: path.join(__dirname, 'session_data'), args: ['--no-sandbox'] });
+            let pages = await browser.pages();
+            while (pages.length > 1) { await pages.pop().close(); }
+            const page = pages[0];
+            await page.goto('https://www.geoguessr.com/signin');
+            await askQuestion('[SYSTEM] Once logged in, press [ENTER]: ');
+            await browser.close();
+            return main();
+        }
+        console.log('OK');
     }
 
-    console.clear();
-    console.log('🚀 LOOP ACTIVATED');
-    await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded' });
-
     while (true) {
-        await sleep(100);
         try {
-            // Fetch game token and initial data
-            if (!activeToken || !currentCoords) {
-                const nextDataState = await page.evaluate(() => {
-                    try { return window.__NEXT_DATA__.props.pageProps.game; } catch (e) { return null; }
+            if (Date.now() - botStartTime > CONFIG.RESTART_INTERVAL_MS) { return main(); }
+
+            if (!session.token) {
+                const r = await requestAPI('/api/v3/games/streak', 'POST', {
+                    "streakType": "CountryStreak", "timeLimit": 120, "forbidMoving": false, "forbidZooming": false, "forbidRotating": false
                 });
-
-                if (nextDataState && nextDataState.token && !activeToken) {
-                    activeToken = nextDataState.token;
-                    activeApiEndpoint = `/api/v3/games/${activeToken}`;
-                    currentCoords = extractCoords(nextDataState);
+                if (r.rateLimit) {
+                    const p = r.is403 ? CONFIG.COOLING_PAUSE_403_MS : CONFIG.RATE_LIMIT_PAUSE_MS;
+                    console.log(`\n[WARNING] Detection ${r.is403 ? '403 Forbidden' : '429 Rate Limit'} - Cooling down (${p / 1000}s)...`);
+                    await sleep(p); continue;
                 }
-
-                if (!activeToken || !currentCoords) {
-                    // Create new game via API if no active session found
-                    console.log("[BOT] 🆕 Creating new game session via API...");
-                    const initData = await page.evaluate(async () => {
-                        try {
-                            const res = await fetch('https://www.geoguessr.com/api/v3/games/streak', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ "streakType": "CountryStreak", "timeLimit": 120, "forbidMoving": false, "forbidZooming": false, "forbidRotating": false })
-                            });
-                            return res.ok ? await res.json() : null;
-                        } catch (e) { return null; }
-                    });
-
-                    if (initData && initData.token) {
-                        activeToken = initData.token;
-                        activeApiEndpoint = `/api/v3/games/${activeToken}`;
-                        currentCoords = extractCoords(initData);
-                        currentStreakCount = 0;
-                        console.log(`[BOT] 🎮 New Game: ${activeToken}`);
-                    } else {
-                        console.log("[BOT] ⚠️ API failure, retrying in 2s...");
-                        await sleep(2000);
-                        continue;
-                    }
-                }
+                if (!r.success) { await sleep(3000); continue; }
+                session.token = r.data.token;
+                session.coords = extractCoords(r.data);
+                session.streak = 0;
+                console.log(`\n[GAME] New ID: ${session.token}`);
             }
 
-            // Execute guess and round progression
-            if (activeToken && currentCoords) {
-                let rStart = performance.now();
-                let payload = { token: activeToken, lat: currentCoords.lat, lng: currentCoords.lng, timedOut: false, stepsCount: 0 };
+            const endpoint = `/api/v3/games/${session.token}`;
+            let times = [];
+            let currentDelay = CONFIG.MIN_DELAY_MS;
 
-                // Force fail at limit to claim XP
-                const isSuicide = (currentStreakCount >= STREAK_LIMIT);
-                if (isSuicide) {
-                    payload.lat = 0; payload.lng = -160; payload.streakLocationCode = "kp";
-                } else if (currentCoords.streakCode) {
-                    payload.streakLocationCode = currentCoords.streakCode;
+            while (session.streak <= CONFIG.STREAK_LIMIT) {
+                if (!session.coords) {
+                    const r = await requestAPI(endpoint);
+                    if (r.success) { session.coords = extractCoords(r.data); }
                 }
 
-                await sleep(API_DELAY_MS);
+                if (!session.coords) { session.token = null; break; }
 
-                // Submit guess via internal API
-                const gRes = await page.evaluate(async (endpoint, p) => {
-                    try {
-                        const res = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p) });
-                        if (!res.ok) return { success: false };
-                        const d = await res.json();
-                        return { success: true, state: d.state };
-                    } catch (e) { return { success: false }; }
-                }, activeApiEndpoint, payload);
+                let start = performance.now();
+                const isFinalRound = (session.streak >= CONFIG.STREAK_LIMIT);
+                let payload = { token: session.token, lat: session.coords.lat, lng: session.coords.lng, timedOut: false, stepsCount: 0 };
 
-                if (!gRes.success) { activeToken = null; continue; }
+                // Intentional error on last round to finalize streak XP
+                if (isFinalRound) { payload.lat = 0; payload.lng = -160; payload.streakLocationCode = "kp"; }
+                else if (session.coords.code) payload.streakLocationCode = session.coords.code;
 
-                // Post-round handling
-                if (gRes.state === 'finished' || isSuicide) {
-                    console.log(`\n[BOT] 🏁 Streak ${currentStreakCount}/${STREAK_LIMIT} finished. XP Claimed.`);
+                // Jitter injection to break automated patterns
+                const jitter = Math.floor(Math.random() * 25);
+                await sleep(currentDelay + jitter);
 
-                    if (isExitingRequested) {
-                        console.log('[STOP] Clean exit. Goodbye!');
-                        await browser.close();
-                        process.exit();
-                    }
-
-                    // Handle scheduled restarts
-                    if (Date.now() - botStartTime > RESTART_INTERVAL_MS) {
-                        console.log('[SYSTEM] 🔄 24h cycle reached. Restarting browser to clear RAM...');
-                        await browser.close();
-                        return main();
-                    }
-
-                    lastCycleStartTime = Date.now();
-                    activeToken = null;
-                    currentCoords = null;
-                    await sleep(1000);
-                } else {
-                    // Fetch next round data without reloading page
-                    currentStreakCount++;
-                    process.stdout.write(`\r[FARMING] Streak: ${currentStreakCount}/${STREAK_LIMIT} | Speed: ${((performance.now() - rStart) / 1000).toFixed(2)}s`);
-
-                    const nData = await page.evaluate(async (e) => {
-                        try {
-                            const r = await fetch(e);
-                            return r.ok ? await r.json() : null;
-                        } catch (e) { return null; }
-                    }, activeApiEndpoint);
-
-                    const nC = extractCoords(nData);
-                    if (nC && (nC.lat !== payload.lat || nC.lng !== payload.lng)) {
-                        currentCoords = nC;
-                    } else {
-                        await sleep(300); // Wait for server generation
-                    }
+                // Guess submission with stealth headers
+                const gRes = await requestAPI(endpoint, 'POST', payload, true);
+                if (gRes.rateLimit) {
+                    const p = gRes.is403 ? CONFIG.COOLING_PAUSE_403_MS : CONFIG.RATE_LIMIT_PAUSE_MS;
+                    console.log(`\n[WARNING] Security encounter (403/429) - Emergency brake (${p / 1000}s)...`);
+                    await sleep(p); break;
                 }
+
+                if (!gRes.success) { session.token = null; break; }
+
+                const gData = gRes.data;
+                if (gData.state === 'finished' || isFinalRound) {
+                    const avg = times.reduce((a, b) => a + b, 0) / times.length;
+                    const xph = Math.floor(3600 / (avg * 50) * 600);
+                    console.log(`\n----------------------------------------------`);
+                    console.log(` Streak Summary: Complete`);
+                    console.log(` Average Speed : ${avg.toFixed(3)}s`);
+                    console.log(` Est. Yield    : ${xph.toLocaleString()} XP/h`);
+                    console.log(`----------------------------------------------\n`);
+                    session.token = null; session.streak = 0; break;
+                }
+
+                session.streak++;
+                let rTime = (performance.now() - start) / 1000;
+                times.push(rTime);
+
+                // Adaptive Throttle + Human-like micro-pauses
+                if (rTime < 0.10) currentDelay = Math.min(CONFIG.MAX_DELAY_MS, currentDelay + 4);
+                else currentDelay = Math.max(CONFIG.MIN_DELAY_MS, currentDelay - 2);
+
+                if (session.streak % 15 === 0) {
+                    // Periodic micro-pause to mimic reading/latency
+                    await sleep(800 + Math.random() * 1200);
+                }
+
+                if (session.streak % 5 === 0) {
+                    const avgLog = times.reduce((a, b) => a + b, 0) / times.length;
+                    process.stdout.write(`\r[STREAK] Progress: ${session.streak}/${CONFIG.STREAK_LIMIT} | Avg: ${avgLog.toFixed(3)}s | Internal Delay: ${currentDelay}ms`);
+                }
+
+                // Data extraction for the next round
+                let nextCoords = extractCoords(gData);
+                if (!nextCoords || (nextCoords.lat === payload.lat && nextCoords.lng === payload.lng)) {
+                    const nR = await requestAPI(endpoint);
+                    if (nR.success) { nextCoords = extractCoords(nR.data); }
+                }
+                if (!nextCoords) { session.token = null; break; }
+                session.coords = nextCoords;
             }
+
+            if (isExitingRequested) { process.exit(); }
+            await sleep(500);
+
         } catch (e) { await sleep(1000); }
     }
 }
