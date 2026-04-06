@@ -37,11 +37,13 @@ Based on community XP data and average bot performance:
 - **Adaptive Throttle**: Self-adjusting delay logic based on real-time server latency.
 
 ## 🚀 Installation & Setup
-1. **Clone the repository**: `git clone https://github.com/AW203/geoguessr-xp-bot.git`
-2. **Paste this command**: `npm install puppeteer-extra puppeteer-extra-plugin-stealth undici puppeteer`
-3. **Install dependencies**: `npm install`
-4. **Run the engine**: `node bot.js`
-5. **Authentication**: Use the built-in login assistant (Chromium) to sign in. Once authenticated, the bot runs in a pure-API "headless" mode.
+1. **Clone the repository or download the zip**: `git clone https://github.com/AW203/geoguessr-xp-bot.git`
+2. **Open a command prompt**
+3. **Navigate to the bot directory** : `cd foldername or complete path`
+4. **Paste this command**: `npm install puppeteer-extra puppeteer-extra-plugin-stealth undici puppeteer`
+5. **Install dependencies**: `npm install`
+6. **Run the engine**: `node bot.js`
+7. **Authentication**: Use the built-in login assistant (Chromium) to sign in. Once authenticated, the bot runs in a pure-API "headless" mode.
 
 ---
 *Disclaimer: This tool is for research and educational purposes only. Use of automation tools may violate terms of service.*
