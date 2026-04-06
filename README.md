@@ -37,7 +37,7 @@ Based on community XP data and average bot performance:
 - **Adaptive Throttle**: Self-adjusting delay logic based on real-time server latency.
 
 ## 🚀 Installation & Setup
-1. **Clone the repository**: `git clone https://github.com/AW203/geoguessr-automation.git`
+1. **Clone the repository**: `git clone https://github.com/AW203/geoguessr-xp-bot.git`
 2. **Install dependencies**: `npm install`
 3. **Run the engine**: `node bot.js`
 4. **Authentication**: Use the built-in login assistant (Chromium) to sign in. Once authenticated, the bot runs in a pure-API "headless" mode.
