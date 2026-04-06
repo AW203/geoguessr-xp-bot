@@ -144,13 +144,40 @@ async function extractSession() {
     while (pages.length > 1) { await pages.pop().close(); }
     const page = pages[0];
     try {
-        await page.goto('https://www.geoguessr.com/', { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await page.goto('https://www.geoguessr.com/', { waitUntil: 'networkidle2', timeout: 30000 });
         await sleep(3000);
-        const isLoggedOut = await page.evaluate(() => document.querySelector('a[href^="/signin"]') !== null);
-        if (isLoggedOut) { await browser.close(); return null; }
-        const pCookies = await page.cookies();
-        session.cookies = pCookies.map(c => `${c.name}=${c.value}`).join('; ');
+        
+        let currentUrl = page.url();
+        let pCookies = await page.cookies();
+        let hasAuthCookie = pCookies.some(c => c.name.includes('ncfa') || c.name === 'sid');
+
+        // If we have cookies but we're still on the landing page, try to force go to /home
+        if (hasAuthCookie && currentUrl === 'https://www.geoguessr.com/') {
+            await page.goto('https://www.geoguessr.com/home', { waitUntil: 'networkidle2' });
+            currentUrl = page.url();
+            pCookies = await page.cookies();
+        }
+
+        const isLoggedOut = await page.evaluate(() => {
+            const hasProfile = document.querySelector('a[href^="/me"]') !== null || 
+                               document.querySelector('div[class*="user-nickname"]') !== null ||
+                               document.querySelector('div[class*="header__user"]') !== null;
+            const hasSignIn = document.querySelector('a[href^="/signin"]') !== null;
+            // We only consider it logged out if there is NO profile AND a sign-in button
+            return !hasProfile && hasSignIn;
+        });
+
+        if (isLoggedOut && !hasAuthCookie) { 
+            console.log(`\n[DEBUG] URL: ${currentUrl}`);
+            console.log(`[DEBUG] Cookies found: ${pCookies.length > 0 ? pCookies.map(c => c.name).join(', ') : 'NONE'}`);
+            console.log(`[DEBUG] Status: Signed out (No valid session detected)`);
+            await browser.close(); return null; 
+        }
+
+        const cookieStr = pCookies.map(c => `${c.name}=${c.value}`).join('; ');
+        session.cookies = cookieStr;
         session.ua = await page.evaluate(() => navigator.userAgent);
+        
         baseHeaders = {
             'content-type': 'application/json',
             'cookie': session.cookies,
@@ -161,16 +188,23 @@ async function extractSession() {
             'accept-language': 'en-US,en;q=0.9',
             'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors', 'sec-fetch-site': 'same-origin', 'dnt': '1'
         };
-    } catch (e) { }
+        
+        if (!hasAuthCookie) {
+            console.log(`\n[DEBUG] Cookies found: ${pCookies.map(c => c.name).join(', ')}`);
+        }
+
+    } catch (e) {
+        console.log(`\n[DEBUG] Extraction Error: ${e.message}`);
+    }
     await browser.close();
-    return (session.cookies && session.cookies.includes('_ncfa')) ? true : null;
+    return (session.cookies && (session.cookies.includes('ncfa') || session.cookies.includes('sid'))) ? true : null;
 }
 
 /**
  * Core execution engine.
  */
 async function main() {
-    console.clear();
+    // console.clear(); // Disabled during login debugging
     console.log('----------------------------------------------');
     console.log('GeoGuessr XP BOT');
     console.log('Mode: Stealth-Adaptive | Pool: undici');
@@ -196,6 +230,7 @@ async function main() {
             await page.goto('https://www.geoguessr.com/signin');
             await askQuestion('[SYSTEM] Once logged in, press [ENTER]: ');
             await browser.close();
+            await sleep(2000); // Give Chrome time to flush session data to disk
             return main();
         }
         console.log('OK');
