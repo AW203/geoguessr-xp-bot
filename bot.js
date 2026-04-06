@@ -197,7 +197,9 @@ async function extractSession() {
         console.log(`\n[DEBUG] Extraction Error: ${e.message}`);
     }
     await browser.close();
-    return (session.cookies && (session.cookies.includes('ncfa') || session.cookies.includes('sid'))) ? true : null;
+    // Accept ncfa, sid, or session as valid auth cookies
+    const isValid = session.cookies && (session.cookies.includes('ncfa') || session.cookies.includes('sid') || session.cookies.includes('session='));
+    return isValid ? true : null;
 }
 
 /**
@@ -241,6 +243,7 @@ async function main() {
             if (Date.now() - botStartTime > CONFIG.RESTART_INTERVAL_MS) { return main(); }
 
             if (!session.token) {
+                process.stdout.write('[SYSTEM] Creating new game session... ');
                 const r = await requestAPI('/api/v3/games/streak', 'POST', {
                     "streakType": "CountryStreak", "timeLimit": 120, "forbidMoving": false, "forbidZooming": false, "forbidRotating": false
                 });
@@ -249,7 +252,11 @@ async function main() {
                     console.log(`\n[WARNING] Detection ${r.is403 ? '403 Forbidden' : '429 Rate Limit'} - Cooling down (${p / 1000}s)...`);
                     await sleep(p); continue;
                 }
-                if (!r.success) { await sleep(3000); continue; }
+                if (!r.success) { 
+                    console.log(`FAILED (${r.error || 'Unknown Error'})`);
+                    await sleep(3000); continue; 
+                }
+                console.log('OK');
                 session.token = r.data.token;
                 session.coords = extractCoords(r.data);
                 session.streak = 0;
