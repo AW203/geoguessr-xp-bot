@@ -1,8 +1,12 @@
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const undici = require('undici');
 const path = require('path');
 const fs = require('fs');
 const readline = require('readline');
+
+// Activate Puppeteer Stealth Plugin
+puppeteer.use(StealthPlugin());
 
 /**
  * GeoGuessr XP BOT
@@ -128,7 +132,13 @@ async function extractSession() {
     const browser = await puppeteer.launch({
         headless: 'new',
         userDataDir: userDataDir,
-        args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage']
+        args: [
+            '--no-sandbox', 
+            '--disable-gpu', 
+            '--disable-dev-shm-usage',
+            '--disable-blink-features=AutomationControlled'
+        ],
+        ignoreDefaultArgs: ['--enable-automation']
     });
     let pages = await browser.pages();
     while (pages.length > 1) { await pages.pop().close(); }
@@ -171,7 +181,15 @@ async function main() {
         const hasSession = await extractSession();
         if (!hasSession) {
             console.log('FAILED\n[SYSTEM] Redirecting to login assistant...');
-            const browser = await puppeteer.launch({ headless: false, userDataDir: path.join(__dirname, 'session_data'), args: ['--no-sandbox'] });
+            const browser = await puppeteer.launch({ 
+                headless: false, 
+                userDataDir: path.join(__dirname, 'session_data'), 
+                args: [
+                    '--no-sandbox',
+                    '--disable-blink-features=AutomationControlled'
+                ],
+                ignoreDefaultArgs: ['--enable-automation']
+            });
             let pages = await browser.pages();
             while (pages.length > 1) { await pages.pop().close(); }
             const page = pages[0];
