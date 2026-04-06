@@ -38,9 +38,10 @@ Based on community XP data and average bot performance:
 
 ## 🚀 Installation & Setup
 1. **Clone the repository**: `git clone https://github.com/AW203/geoguessr-xp-bot.git`
-2. **Install dependencies**: `npm install`
-3. **Run the engine**: `node bot.js`
-4. **Authentication**: Use the built-in login assistant (Chromium) to sign in. Once authenticated, the bot runs in a pure-API "headless" mode.
+2. **Paste this command**: `npm install puppeteer-extra puppeteer-extra-plugin-stealth undici puppeteer`
+3. **Install dependencies**: `npm install`
+4. **Run the engine**: `node bot.js`
+5. **Authentication**: Use the built-in login assistant (Chromium) to sign in. Once authenticated, the bot runs in a pure-API "headless" mode.
 
 ---
 *Disclaimer: This tool is for research and educational purposes only. Use of automation tools may violate terms of service.*
