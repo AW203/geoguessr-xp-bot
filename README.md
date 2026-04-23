@@ -1,8 +1,8 @@
-# GeoGuessr XP BOT (v5.5 Stealth)
+# GeoGuessr XP BOT 
 
-A highly optimized, professional-grade Node.js automation script for GeoGuessr Country Streaks. Built with performance and stability in mind.
+A highly optimized Node.js automation script for GeoGuessr Country Streaks. 
 
-## 📊 Performance Metrics (Real-World)
+## 📊 Performance Metrics
 
 Benchmarks based on the latest **Stealth-Adaptive** engine (including security pauses):
 
